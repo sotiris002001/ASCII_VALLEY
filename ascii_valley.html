@@ -1,0 +1,476 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ASCII Valley</title>
+<style>html,body{margin:0;height:100%;background:#0b1020;overflow:hidden}canvas{position:fixed;left:0;top:0;width:100vw;height:100vh}</style>
+</head><body><canvas id="gl"></canvas><canvas id="hud"></canvas>
+<script>
+"use strict";
+// ═══ Πλήκτρα ═══  Space pause · T ώρα · E εποχή · S screenshot
+// Πλάτος κελιού σε pixel (ύψος = 2×):  ascii_valley.html?cell=2 (πιο ευκρινές) ή ?cell=4 (πιο ελαφρύ)
+const Q=typeof location!=="undefined"?new URLSearchParams(location.search):new URLSearchParams("");
+const clamp=(v,a,b)=>v<a?a:v>b?b:v,sm=(a,b,x)=>{x=clamp((x-a)/(b-a),0,1);return x*x*(3-2*x)};
+const mix=(a,b,t)=>[a[0]+(b[0]-a[0])*t,a[1]+(b[1]-a[1])*t,a[2]+(b[2]-a[2])*t];
+const FIXED=+Q.get("cell")||0;let CWC=clamp(FIXED||3,2,10);
+const SIGNATURE="@ascii.valley",BW=700,BH=784,FPS=30,DAY=240,P0=.06,SPEED=3.2,CRUISE=12;
+const P=192,HALF=96,RES=3,NX=HALF*2*RES,NZ=P*RES,WL=1,TAU=Math.PI*2,F=BH*.95,MAXZ=160;
+let seed=5;const rnd=()=>{seed|=0;seed=seed+0x6D2B79F5|0;let t=Math.imul(seed^seed>>>15,1|seed);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296};
+const gs=s=>(s+s[s.length-1].repeat(16)).slice(0,16);
+// σετ χαρακτήρων σκούρο → φωτεινό: γρασίδι, βράχος, χιόνι, άμμος, νερό, φύλλα, ξύλο, σύννεφο, βελόνες
+const SETS=[".,'\":;^+vwxXW&%#",".:-=+*xX%#&@MWW@",". .:'*+oO0@@@@@@@",".,:;-~=+*x%#&@@@",".-~-~=~=~=~*~*+",".:;-=+*^vxoXW&%#@","|!il1IH#@@@@@@@@@","  ..::;;-=+*oO0@@",".,'`^^~vVYAWM#@"];
+const CC=SETS.map(s=>Array.from(s,c=>c.charCodeAt(0)));
+const [G_GRASS,G_ROCK,G_SNOW,G_SAND,G_WATER,G_LEAF,G_WOOD,G_CLOUD,G_NEEDLE]=[0,1,2,3,4,5,6,7,8];
+
+// ═══ θόρυβος και ύψος εδάφους (περιοδικό στον άξονα z → η πτήση δεν τελειώνει ποτέ) ═══
+function hash(ix,iz){let h=(ix*374761393+iz*668265263)|0;h=(h^(h>>>13))*1274126177|0;return((h^(h>>>16))>>>0)/4294967296}
+function vnoise(x,z,pz){const ix=Math.floor(x),iz=Math.floor(z),fx=x-ix,fz=z-iz,ux=fx*fx*(3-2*fx),uz=fz*fz*(3-2*fz),
+  z0=((iz%pz)+pz)%pz,z1=(((iz+1)%pz)+pz)%pz,a=hash(ix,z0),b=hash(ix+1,z0),c=hash(ix,z1),d=hash(ix+1,z1);
+  return a+(b-a)*ux+(c-a)*uz+(a-b-c+d)*ux*uz}
+function fbm(x,z){let s=0,a=.5,f=1/24;for(let o=0;o<5;o++){s+=a*vnoise(x*f,z*f,Math.round(P*f));a*=.5;f*=2}return s}
+const mer=z=>14*Math.sin(TAU*z/P)+6*Math.sin(TAU*3*z/P+1.3);          // το ποτάμι μαιανδρίζει
+function terrainH(x,z){
+  const u=x-mer(z),au=Math.abs(u),val=1-Math.exp(-u*u/648),n=fbm(x,z)-.48,dz=((z-100+P/2)%P+P)%P-P/2;
+  let h=1.2+14*Math.pow(val,1.3)+n*(3+26*val);                          // κοιλάδα + λόφοι
+  // Λεπτή ανομοιομορφία στο έδαφος, εντονότερη μακριά από την κοίτη.
+  h+=(vnoise(x*.22+17,z*.22+9,Math.max(8,Math.round(P*.22)))-.5)*.72*sm(2,12,au);
+  // Ακανόνιστες μικρές προεξοχές στις όχθες, χωρίς να χαλάει η βασική πορεία του ποταμού.
+  const bank=sm(1.2,3.5,au)*(1-sm(7,10,au)),bn=vnoise(x*.31+43,z*.31+21,Math.max(8,Math.round(P*.31)));
+  h+=(bn-.5)*1.15*bank;
+  const m=Math.max(0,(au-40)/40);h+=26*m*m*(1+.6*(fbm(x+57,z)-.4));      // βουνά στο βάθος
+  return h-3.4*Math.exp(-u*u/18)-5.6*Math.exp(-((u-2)*(u-2)/60+dz*dz/340))}   // κοίτη ποταμού + λίμνη γύρω στο z=100
+
+const NN=NX*NZ,Hm=new Float32Array(NN),Nx=new Float32Array(NN),Ny=new Float32Array(NN),Nz=new Float32Array(NN),Cm=new Uint8Array(NN*3),Km=new Uint8Array(NN),Am=new Uint8Array(NN);
+let Sh=new Uint8Array(NN),TS=new Uint8Array(NN),TB=new Uint8Array(NN);   // σκιές εδάφους (λόφοι), σκιές δέντρων (ζωντανό + υπό κατασκευή)
+for(let j=0;j<NZ;j++)for(let i=0;i<NX;i++)Hm[j*NX+i]=terrainH(-HALF+i/RES,j/RES);
+const OFF=3*RES;
+for(let j=0;j<NZ;j++)for(let i=0;i<NX;i++){
+  const b=j*NX+i,x=-HALF+i/RES,z=j/RES,h=Hm[b],xl=Math.max(i-1,0),xr=Math.min(i+1,NX-1),jd=(j+NZ-1)%NZ,ju=(j+1)%NZ;
+  const dx=(Hm[j*NX+xr]-Hm[j*NX+xl])*RES/2,dz=(Hm[ju*NX+i]-Hm[jd*NX+i])*RES/2,l=Math.hypot(dx,1,dz);
+  Nx[b]=-dx/l;Ny[b]=1/l;Nz[b]=-dz/l;
+  const avg=(Hm[j*NX+Math.max(i-OFF,0)]+Hm[j*NX+Math.min(i+OFF,NX-1)]+Hm[((j+OFF)%NZ)*NX+i]+Hm[((j+NZ-OFF)%NZ)*NX+i])/4;
+  Am[b]=clamp(1-(avg-h)*.09,.55,1.2)*100;
+  const s=1-Ny[b],m=vnoise(x/12+9,z/12,16),n2=hash(i,j),pn=vnoise(x/3+5,z/3,64),pu=x-mer(z)-(8+2*Math.sin(z/9));let k=0,r,g,bl;
+  if(h>30+(m-.5)*6){k=2;r=g=bl=232+n2*20}
+  else if(s>.36||h>25){k=1;const v=.82+.18*Math.sin(h*2.4+pn*4)+n2*.12;r=118*v;g=112*v;bl=106*v}
+  else if(h<WL+.55){k=3;const w=n2>.8?.78:1;r=196*w;g=178*w;bl=122*w}
+  else if(Math.abs(pu)<.8&&s<.22){k=3;const w=.85+.3*n2;r=158*w;g=130*w;bl=94*w}                  // μονοπάτι δίπλα στο ποτάμι
+  else{const v=.78+.42*pn;r=(48+100*m)*v;g=(128+22*m)*v;bl=(44+10*m)*v}
+  Cm[b*3]=r;Cm[b*3+1]=g;Cm[b*3+2]=bl;Km[b]=k}
+function hAt(x,z){let xi=clamp((x+HALF)*RES,0,NX-1.01),zi=z*RES;zi-=Math.floor(zi/NZ)*NZ;
+  const i=xi|0,j=zi|0,a=xi-i,c=zi-j,j1=(j+1)%NZ;return Math.max(WL,Hm[j*NX+i]*(1-a)*(1-c)+Hm[j*NX+i+1]*a*(1-c)+Hm[j1*NX+i]*(1-a)*c+Hm[j1*NX+i+1]*a*c)}
+const CT=new Float32Array(4096);{const L=Array.from({length:64},rnd);for(let j=0;j<64;j++)for(let i=0;i<64;i++){const u=i/8,v=j/8,iu=Math.floor(u),iv=Math.floor(v),fu=u-iu,fv=v-iv,a=sm(0,1,fu),b=sm(0,1,fv),
+  g=(p,q)=>L[((q&7)<<3)|(p&7)];CT[j*64+i]=g(iu,iv)*(1-a)*(1-b)+g(iu+1,iv)*a*(1-b)+g(iu,iv+1)*(1-a)*b+g(iu+1,iv+1)*a*b}}
+function cloudS(x,z,t){const u=x*.04+t*.06,v=z*.04,iu=Math.floor(u),iv=Math.floor(v),fu=u-iu,fv=v-iv,i0=iu&63,j0=iv&63,i1=(i0+1)&63,j1=(j0+1)&63,
+  a=CT[j0*64+i0],b=CT[j0*64+i1],c=CT[j1*64+i0],d=CT[j1*64+i1];return sm(.5,.74,a+(b-a)*fu+(c-a)*fv+(a-b-c+d)*fu*fv)}
+
+// ═══ πρότυπα από σημεία: [x,y,z, nx,ny,nz, είδος, απόκρυψη φωτός] ═══
+// είδη: 0 φύλλα · 1 ξύλο · 2-4 τόνοι φύλλων · 6 καλάμι
+const ST=8,Pt=(d,x,y,z,nx,ny,nz,k,ao)=>d.push(x,y,z,nx,ny,nz,k,ao),TN=[0,2,3,4];
+const rv=()=>{const w=[rnd()-.5,rnd()-.5,rnd()-.5],l=Math.hypot(...w)||1;return[w[0]/l,w[1]/l,w[2]/l]};
+function trunkPts(d,h,r0,n){for(let q=0;q<n;q++){const y=q*h/n,r=r0*(1+.9*Math.max(0,1-q/3));for(let m=0;m<2;m++){const a=rnd()*TAU;Pt(d,Math.cos(a)*r,y,Math.sin(a)*r,Math.cos(a),0,Math.sin(a),1,1)}}}
+function conifer(v){const d=[],R0=[1.5,1.9,2.0][v],Ht=[6.4,6.0,5.2][v],tiers=[8,6,7][v],y00=[.9,1.9,.5][v];
+  for(let L=0;L<tiers;L++){const u=L/tiers,y0=y00+(Ht-y00-.6)*u,R=R0*(1-u*.9)*(v===1?.75+.5*rnd():1),nb=Math.max(4,Math.round((v===2?9:7)*(1-u*.6)));
+    for(let b=0;b<nb;b++){const a=TAU*(b+rnd()*.7)/nb+L*.8,tone=TN[(rnd()*4)|0];
+      for(let q=1;q<=4;q++){const r=R*(q/4)*(.85+rnd()*.3),aa=a+(rnd()-.5)*.28,ca=Math.cos(aa),sa=Math.sin(aa),y=y0-r*.22-q*.04,j=(rnd()-.5)*.1;
+        Pt(d,ca*r,y+.06+j,sa*r,ca*.55,.85,sa*.55,tone,.8+.2*q/4);
+        Pt(d,ca*r*.97,y-.12+j,sa*r*.97,ca*.5,-.7,sa*.5,tone,.5)}}}
+  trunkPts(d,Ht-.4,.08,12);Pt(d,0,Ht,0,0,1,0,0,1);return d}
+function broadleaf(v){
+  const d=[],trH=[2.2,2.6,2.4][v],height=[3.3,3.8,3.2][v];
+  trunkPts(d,trH,v===2?.065:.09,18);
+
+  // Ασύμμετρος σκελετός με κλαδιά διαφορετικού μήκους και κλίσης.
+  const branches=v===0?5:v===1?6:4;
+  for(let b=0;b<branches;b++){
+    const a=TAU*b/branches+(rnd()-.5)*.65;
+    const len=.75+rnd()*.85,rise=.65+rnd()*.55;
+    for(let q=1;q<=9;q++){
+      const u=q/9,x=Math.cos(a)*len*u,z=Math.sin(a)*len*u,y=trH-.12+rise*u;
+      Pt(d,x,y,z,Math.cos(a)*.7,.35,Math.sin(a)*.7,1,.85);
+      if(q===5||q===8){
+        const aa=a+(rnd()-.5)*1.1,ll=.35+rnd()*.35;
+        for(let j=1;j<=4;j++){const f=j/4;
+          Pt(d,x+Math.cos(aa)*ll*f,y+.12*f,z+Math.sin(aa)*ll*f,Math.cos(aa),.25,Math.sin(aa),1,.8)}
+      }
+    }
+  }
+
+  // Ανομοιόμορφοι λοβοί αντί για μία σφαιρική μάζα φυλλώματος.
+  const lobes=v===0?6:v===1?7:5,centers=[];
+  for(let c=0;c<lobes;c++){
+    const a=TAU*c/lobes+(rnd()-.5)*.8,ring=.25+rnd()*.62;
+    centers.push([Math.cos(a)*ring,trH+.45+rnd()*height*.52,Math.sin(a)*ring,
+      (v===1?.72:.62)+rnd()*.38,.72+rnd()*.52,(v===2?.62:.72)+rnd()*.38]);
+  }
+  for(let c=0;c<centers.length;c++){
+    const [cx,cy,cz,rx,ry,rz]=centers[c],tone=TN[(rnd()*4)|0],count=34+(rnd()*17|0);
+    for(let q=0;q<count;q++){
+      const [nx,ny,nz]=rv(),rad=Math.pow(rnd(),.58);
+      const wobble=1+.13*Math.sin(Math.atan2(nz,nx)*3+c*1.7)+.08*(rnd()-.5);
+      const x=cx+nx*rx*rad*wobble,y=cy+ny*ry*rad*wobble,z=cz+nz*rz*rad*wobble;
+      const normal=[nx/Math.max(.1,rx),ny/Math.max(.1,ry),nz/Math.max(.1,rz)],nl=Math.hypot(...normal);
+      Pt(d,x,y,z,normal[0]/nl,normal[1]/nl,normal[2]/nl,tone,.48+.52*(ny+1)/2);
+    }
+  }
+  return d
+}
+function shrub(){
+  // Χαμηλός, πλατύς θάμνος με ακανόνιστη περίμετρο και μικρούς λοβούς.
+  const d=[],lobes=5+(rnd()*3|0);
+  for(let b=0;b<5;b++){
+    const a=TAU*b/5+(rnd()-.5)*.6,len=.28+rnd()*.34;
+    for(let q=1;q<=5;q++){const u=q/5;
+      Pt(d,Math.cos(a)*len*u,.12+.34*u,Math.sin(a)*len*u,Math.cos(a)*.7,.45,Math.sin(a)*.7,1,.8)}
+  }
+  for(let c=0;c<lobes;c++){
+    const a=TAU*c/lobes+(rnd()-.5)*.9,ring=.12+rnd()*.42;
+    const cx=Math.cos(a)*ring,cz=Math.sin(a)*ring,cy=.38+rnd()*.28;
+    const rx=.34+rnd()*.22,ry=.32+rnd()*.2,rz=.34+rnd()*.22;
+    const count=20+(rnd()*13|0),tone=TN[(rnd()*4)|0];
+    for(let q=0;q<count;q++){
+      const [nx,ny,nz]=rv(),rad=Math.pow(rnd(),.62);
+      const wobble=1+.16*Math.sin(Math.atan2(nz,nx)*3+c)+.08*(rnd()-.5);
+      const x=cx+nx*rx*rad*wobble,y=Math.max(.035,cy+ny*ry*rad*wobble),z=cz+nz*rz*rad*wobble;
+      const normal=[nx/rx,ny/ry,nz/rz],nl=Math.hypot(...normal);
+      Pt(d,x,y,z,normal[0]/nl,normal[1]/nl,normal[2]/nl,q%7===0?2:tone,.48+.52*(ny+1)/2);
+    }
+  }
+  return d
+}
+function reeds(){   // λεπτές κατακόρυφες λεπίδες με σκουρόχρωμη κορυφή
+  const d=[];for(let b=0;b<8;b++){const x=(rnd()-.5)*.9,z=(rnd()-.5)*.9,l=1+rnd()*.9,ln=(rnd()-.5)*.3;
+    for(let q=0;q<5;q++)Pt(d,x+ln*q/5*l,q*l/5,z,0,1,.2,6,.65+.35*q/5);Pt(d,x+ln*l,l+.08,z,0,1,0,1,.9)}return d}
+// 0-2 κωνοφόρα · 3-5 φυλλοβόλα · 6 θάμνος · 7 καλάμια
+const TPL=[0,1,2].map(v=>conifer(v)).concat([0,1,2].map(v=>broadleaf(v)),[shrub(),reeds()]).map(d=>({d:new Float32Array(d),n:d.length/ST}));
+const IMP=[[1.5,6.4,.5],[1.9,6.0,1.8],[2.0,5.2,.4],[2.0,5.0,2.0],[.9,6.2,2.2],[1.2,5.2,2.2]],TIERS=[8,6,7],PLOD=[38,30],
+  FOLC=[[30,86,52],[40,100,58],[26,78,60]],FOL=[[0,0,0],[56,134,52],[110,156,52],[212,126,40],[196,66,44]],AUT=[[212,126,40],[196,66,44],[235,190,60],[150,160,50]],BLO=[[240,170,200],[246,240,236]],
+  TRK=[[80,58,40],[88,64,44],[74,54,40],[92,66,44],[100,80,60],[176,170,160]],TONE=[[1,1,1],[1,1,1],[1.15,1.05,.8],[.8,.9,.92],[1.15,1.15,1.1]],
+  KCOL=[0,[104,76,50],0,0,0,0,[142,160,72]],BN=Float32Array.from({length:4096},rnd);
+const FOLS=FOL.map(c=>c.slice()),FOLCS=FOLC.map(c=>c.slice());
+
+// ═══ στιγμιότυπα: δέντρα, θάμνοι, καλάμια ═══
+const tx=[],tz=[],ty=[],ts=[],tw=[],tca=[],tsa=[],tv=[],tc=[],tb=[],TREEIDX=[];
+function inst(x,z,y,sc,wd,ang,v,c){tx.push(x);tz.push(z);ty.push(y);ts.push(sc);tw.push(wd);tca.push(Math.cos(ang));tsa.push(Math.sin(ang));tv.push(v);tc.push(c);tb.push(rnd());return tx.length-1}
+for(let a=0;a<30000&&TREEIDX.length<3400;a++){
+  const x=-HALF+8+rnd()*(2*HALF-16),z=rnd()*P,ci=((x+HALF)*RES)|0,cj=(z*RES)|0,b=cj*NX+ci,h=Hm[b];
+  if(h<WL+.7||h>24||1-Ny[b]>.25||Km[b]===3)continue;
+  if(rnd()>(vnoise(x/12+3,z/12,16)-.36)*2.4)continue;
+  const type=h>14||rnd()<.45?0:1,r=rnd(),sc=.75+rnd()*.8,v=type?3+((rnd()*3)|0):((rnd()*3)|0);
+  TREEIDX.push(inst(x,z,h,sc,.85+rnd()*.35,rnd()*TAU,v,type?(v===5?(r<.7?2:1):(r<.5?1:r<.75?2:r<.9?3:4)):0));
+  const rad=Math.ceil(1.6*sc*RES);
+  for(let dj=-rad;dj<=rad;dj++)for(let di=-rad;di<=rad;di++){const d2=(di*di+dj*dj)/(rad*rad);if(d2>1)continue;const ii=ci+di,jj=((cj+dj)%NZ+NZ)%NZ;if(ii<0||ii>=NX)continue;
+    const q=(1-.5*(1-d2)*(1-d2)),o=(jj*NX+ii)*3;Cm[o]*=q;Cm[o+1]*=q;Cm[o+2]*=q}}
+const NTREE=TREEIDX.length;
+function scatter(n,tries,v,ok,scl,tcs){for(let a=0,c=0;a<tries&&c<n;a++){const x=-HALF+8+rnd()*(2*HALF-16),z=rnd()*P,b=(((z*RES)|0)*NX)+(((x+HALF)*RES)|0),h=Hm[b];
+  if(!ok(x,z,h,b))continue;inst(x,z,h,scl[0]+rnd()*scl[1],.85+rnd()*.35,rnd()*TAU,v,tcs[(rnd()*tcs.length)|0]);c++}}
+scatter(1500,20000,6,(x,z,h,b)=>h>WL+.6&&1-Ny[b]<.4&&Km[b]===0&&vnoise(x/8,z/8,24)>.42,[.9,.7],[1,1,2]);     // πράσινοι θάμνοι
+scatter(900,60000,7,(x,z,h,b)=>h>WL-.2&&h<WL+.4,[.8,.6],[1]);                                                  // καλάμια στα ρηχά
+const NT=tx.length;
+
+// ═══ κατάσταση: εποχή ═══
+const ctl={ss:1.15,ssT:1.15};let SP={tint:[1,1,1],aut:.2,leaf:1,snow:0,blo:0,grass:[1,1,1]};
+const SEAS=[{tint:[1.12,1.18,.82],aut:0,leaf:1,snow:0,blo:.4,grass:[1,1.14,.9]},{tint:[1,1,1],aut:.15,leaf:1,snow:0,blo:0,grass:[1,1,1]},
+  {tint:[1.15,.92,.7],aut:1,leaf:.92,snow:0,blo:0,grass:[1.22,.9,.62]},{tint:[.9,.95,1],aut:0,leaf:.04,snow:1,blo:0,grass:[.95,.97,1]}],SEASN=["άνοιξη","καλοκαίρι","φθινόπωρο","χειμώνας"];
+function seasonUpdate(){const s=((ctl.ss%4)+4)%4,i=Math.floor(s),f=sm(0,1,s-i),A=SEAS[i],B2=SEAS[(i+1)%4],L=(a,b)=>a+(b-a)*f,V=(a,b)=>a.map((x,k)=>x+(b[k]-x)*f);
+  SP={tint:V(A.tint,B2.tint),aut:L(A.aut,B2.aut),leaf:L(A.leaf,B2.leaf),snow:L(A.snow,B2.snow),blo:L(A.blo,B2.blo),grass:V(A.grass,B2.grass)};
+  const om=clamp(.55+SP.aut*.9-SP.blo*1.5,0,1);
+  for(let k=1;k<5;k++)for(let q=0;q<3;q++){const bs=k>=3?[96,150,52][q]*(1-om)+FOL[k][q]*om:FOL[k][q];FOLS[k][q]=bs*SP.tint[q]*(1-SP.aut)+AUT[k%4][q]*SP.aut}
+  for(let v=0;v<3;v++)for(let q=0;q<3;q++)FOLCS[v][q]=FOLC[v][q]*(.6+.4*SP.tint[q])}
+function updateState(t,dt){ctl.ss+=(ctl.ssT-ctl.ss)*(1-Math.exp(-dt*1.2));seasonUpdate()}
+
+// ═══ ουρανός, ήλιος, φως ═══
+const NIGHT_T=[6,8,22],NIGHT_H=[14,18,40],DAY_T=[44,104,196],DAY_H=[176,208,236],WARM_H=[255,150,96];
+function env(t){
+  const ang=TAU*(t/DAY+P0),sy=Math.sin(ang),n=Math.hypot(Math.cos(ang)*.85,sy,.25),day=sm(-.12,.32,sy),warm=Math.exp(-Math.pow((sy-.02)/.2,2));
+  let top=mix(NIGHT_T,DAY_T,day),hor=mix(NIGHT_H,DAY_H,day);hor=mix(hor,WARM_H,warm*.85);top=mix(top,[120,90,130],warm*.3);
+  const sunC=mix([255,160,92],[255,244,226],sm(0,.5,sy)).map(v=>v/255),sunI=sm(-.06,.22,sy)*1.15,am=mix([.16,.20,.34],[.50,.58,.70],day);
+  return{ang,sy,S:[Math.cos(ang)*.85/n,sy/n,.25/n],day,warm,night:1-day,top,hor,sunC,sunI,amb:am,hour:(6+24*ang/TAU)%24}}
+
+// ═══ διάταξη πλέγματος (full screen, κελιά CWC×2·CWC pixel) ═══
+let W,H,CW,CH,COLS,ROWS,NC,Hz,code,cr,cg,cb,zb,win,aux,A,B,SKYT;const NOI=Float32Array.from({length:1024},rnd),FOGT=Float32Array.from({length:330},(_,i)=>1-Math.exp(-i/2*.0135));
+const MONO="'DejaVu Sans Mono',Consolas,Menlo,'Courier New',monospace";
+const NSTAR=2400,STAR_AZ=Float32Array.from({length:NSTAR},()=>rnd()*TAU),STAR_EL=Float32Array.from({length:NSTAR},()=>Math.asin(rnd())),STAR_B=Float32Array.from({length:NSTAR},rnd);   // αστέρια πάνω στην ουράνια σφαίρα
+let FX=0,FZ=1,RX=1,RZ=0,TANR=0,DT=1/30,flightZ=0,prevYaw=0,rollS=0,visTrees=0;
+
+// ═══ WebGL2: η GPU ζωγραφίζει όλο το πλέγμα ═══
+const glc=document.getElementById("gl"),hud=document.getElementById("hud"),hx=hud.getContext("2d"),gl=glc.getContext("webgl2",{antialias:false,alpha:false,preserveDrawingBuffer:true});
+if(!gl){document.body.innerHTML='<p style="color:#ccd;font:16px monospace;padding:24px">Χρειάζεται WebGL2 (Chrome, Firefox, Edge).</p>';throw new Error("WebGL2 required")}
+const VS="#version 300 es\nvoid main(){vec2 p=vec2((gl_VertexID<<1)&2,gl_VertexID&2);gl_Position=vec4(p*2.-1.,0,1);}";
+const FS=`#version 300 es
+precision highp float;uniform sampler2D uA,uB,uT;uniform vec2 uGrid,uCell,uRes;uniform float uLod;out vec4 o;
+void main(){vec2 p=vec2(gl_FragCoord.x,uRes.y-gl_FragCoord.y)/uCell,ci=floor(p),f=fract(p);
+  vec4 a=texture(uA,(ci+.5)/uGrid);vec3 bg=texture(uB,p/uGrid).rgb;float c=floor(a.a*255.+.5)-32.;
+  vec2 g=vec2(mod(c,16.),floor(c/16.));float cov=c<1.?0.:textureLod(uT,(g+f)/vec2(16.,8.),uLod).r;
+  o=vec4(mix(bg,a.rgb,clamp(cov*1.25,0.,1.)),1);}`;
+function shader(t,s){const o=gl.createShader(t);gl.shaderSource(o,s);gl.compileShader(o);if(!gl.getShaderParameter(o,gl.COMPILE_STATUS))console.error(gl.getShaderInfoLog(o));return o}
+const prog=gl.createProgram();gl.attachShader(prog,shader(gl.VERTEX_SHADER,VS));gl.attachShader(prog,shader(gl.FRAGMENT_SHADER,FS));gl.linkProgram(prog);gl.useProgram(prog);
+const U=n=>gl.getUniformLocation(prog,n);
+function tex(unit,min,mag){const t=gl.createTexture();gl.activeTexture(gl.TEXTURE0+unit);gl.bindTexture(gl.TEXTURE_2D,t);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,min);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,mag);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);return t}
+const tA=tex(0,gl.NEAREST,gl.NEAREST),tB=tex(1,gl.LINEAR,gl.LINEAR),tT=tex(2,gl.LINEAR_MIPMAP_LINEAR,gl.LINEAR);
+{const at=document.createElement("canvas");at.width=at.height=128;const ac=at.getContext("2d");ac.fillStyle="#000";ac.fillRect(0,0,128,128);ac.fillStyle="#fff";
+  ac.font="bold 13px "+MONO;ac.textAlign="center";ac.textBaseline="middle";
+  for(let c=32;c<128;c++){const g=c-32;ac.fillText(String.fromCharCode(c),(g%16)*8+4,Math.floor(g/16)*16+8)}
+  gl.activeTexture(gl.TEXTURE2);gl.bindTexture(gl.TEXTURE_2D,tT);gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,at);gl.generateMipmap(gl.TEXTURE_2D)}
+gl.uniform1i(U("uA"),0);gl.uniform1i(U("uB"),1);gl.uniform1i(U("uT"),2);
+function layout(){
+  const dpr=window.devicePixelRatio||1,k=innerHeight/BH;W=innerWidth/k;H=BH;CW=CWC/k;CH=2*CWC/k;COLS=Math.ceil(W/CW);ROWS=Math.ceil(H/CH);NC=COLS*ROWS;Hz=H*.4;
+  glc.width=hud.width=Math.round(innerWidth*dpr);glc.height=hud.height=Math.round(innerHeight*dpr);gl.viewport(0,0,glc.width,glc.height);
+  code=new Uint16Array(NC);zb=new Float32Array(NC);win=new Int32Array(NC);aux=new Uint8Array(NC);cr=new Float32Array(NC);cg=new Float32Array(NC);cb=new Float32Array(NC);
+  A=new Uint8ClampedArray(NC*4);B=new Uint8ClampedArray(NC*4);SKYT=new Float32Array(768);
+  for(const [u,t] of [[0,tA],[1,tB]]){gl.activeTexture(gl.TEXTURE0+u);gl.bindTexture(gl.TEXTURE_2D,t);gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,COLS,ROWS,0,gl.RGBA,gl.UNSIGNED_BYTE,null)}
+  gl.uniform2f(U("uGrid"),COLS,ROWS);gl.uniform2f(U("uCell"),CWC*dpr,2*CWC*dpr);gl.uniform2f(U("uRes"),glc.width,glc.height);gl.uniform1f(U("uLod"),Math.max(0,Math.log2(8/(CWC*dpr))))}
+
+// ═══ σκιές: λόφοι (σταδιακός υπολογισμός ανά καρέ) + δέντρα (σταμπάρισμα σε εναλλασσόμενο buffer) ═══
+let shJ=0,stampN=0;
+function shadowStep(E){
+  const up=E.sy>.03,hl=Math.hypot(E.S[0],E.S[2])||1e-6,dxs=E.S[0]/hl,dzs=E.S[2]/hl,sl=E.S[1]/hl;
+  for(let n=0;n<12;n++,shJ=(shJ+1)%NZ){
+    if(shJ===0){const t=TS;TS=TB;TB=t;TB.fill(0);stampN=0}
+    const row=shJ*NX,z0=shJ/RES;
+    for(let i=0;i<NX;i++){if(!up){Sh[row+i]=255;continue}
+      const h=Hm[row+i],x0=-HALF+i/RES;let mx=0;
+      for(let k=1;k<=22;k++){const d=k*1.5,xi=((x0+dxs*d+HALF)*RES)|0;if(xi<0||xi>=NX)break;let zi=((z0+dzs*d)*RES)|0;zi=((zi%NZ)+NZ)%NZ;
+        const ex=Hm[zi*NX+xi]-(h+sl*d);if(ex>mx){mx=ex;if(mx>1.5)break}}
+      Sh[row+i]=clamp(mx*.9,0,1)*255}}
+  if(up)for(let c=0;c<80&&stampN<NTREE;c++,stampN++){const ti=TREEIDX[stampN],v=tv[ti],s=ts[ti],Ht=(v<3?[6.4,6,5.2][v]:[4.9,6.2,5.2][v-3])*s,ld=Math.min(14,Ht/Math.max(.18,E.S[1]/hl)),rr=Math.max(2,Math.round(1.1*s*RES));
+    for(let k=0;k<=ld;k++){const px=tx[ti]-dxs*k,pz=tz[ti]-dzs*k,ci=((px+HALF)*RES)|0,cj=(pz*RES)|0,val=190*(1-.6*k/Math.max(1,ld)),r2=Math.max(1,Math.round(rr*(1-.4*k/Math.max(1,ld))));
+      for(let dj=-r2;dj<=r2;dj++)for(let di=-r2;di<=r2;di++){if(di*di+dj*dj>r2*r2)continue;const ii=ci+di;if(ii<0||ii>=NX)continue;const idx=((((cj+dj)%NZ)+NZ)%NZ)*NX+ii;if(TB[idx]<val)TB[idx]=val}}}}
+
+// ═══ νερό: πολλαπλά στρώματα κυματισμού κατά μήκος της κοίτης ═══
+function waterFlow(x,z,t){
+  const u=x-mer(z),phase=z*1.12-t*2.05+Math.sin(u*.34+z*.11)*.72;
+  const cross=u*2.15+Math.sin(z*.39-t*.52)*.42;
+  const a=Math.sin(phase),b=Math.sin(phase*1.71+cross*.62),c=Math.sin(cross*1.48-z*.31-t*.68);
+  const wave=.53*a+.29*b+.18*c;
+  const fine=Math.sin(phase*3.1+cross*1.4)*.5+.5;
+  const crest=clamp((wave-.48)*2.2,0,1);
+  return {wave,fine,crest}
+}
+
+// ═══ έδαφος: ray-marching ύψους ανά στήλη, από κοντά προς μακριά ═══
+function terrain(cx,cz,cy,E,t){
+  const fx=FX,fz=FZ,rx=RX,rz=RZ,[S0,S1,S2]=E.S,sunI=E.sunI,[a0,a1,a2]=E.amb,[u0,u1,u2]=E.sunC,[f0,f1,f2]=E.hor,sunUp=E.sy>.05,lf=Math.min(1,(a0+a1+a2)/3+.6*sunI),
+    sn0=SP.snow,gt=SP.grass,cs0=sunI>.04;
+  for(let c=0;c<COLS;c++){
+    const dxp=(c+.5)*CW-W/2,a=dxp/F,dx=fx+a*rx,dz=fz+a*rz,Hc=Hz+dxp*TANR;let top=ROWS,zc=1.2;
+    while(zc<MAXZ&&top>0){
+      const x=cx+zc*dx,z=cz+zc*dz;let xi=(x+HALF)*RES;xi=xi<0?0:xi>NX-1.01?NX-1.01:xi;let zi=z*RES;zi-=Math.floor(zi/NZ)*NZ;
+      const i0=xi|0,j0=zi|0,ax=xi-i0,az=zi-j0,j1=j0+1>=NZ?0:j0+1,b0=j0*NX+i0,b1=j1*NX+i0;
+      let h=Hm[b0]*(1-ax)*(1-az)+Hm[b0+1]*ax*(1-az)+Hm[b1]*(1-ax)*az+Hm[b1+1]*ax*az;const isW=h<WL,raw=h;if(isW)h=WL;
+      const rt=Math.floor((Hc+(cy-h)*F/zc)/CH);
+      if(rt<top){
+        const f=FOGT[(zc*2)|0];let R,G,B,gset,v,gint=false;
+        if(isW){
+          const dep=clamp((WL-raw)/3.4,0,1),
+            refl=(.34+.42*Math.min(1,zc/75))*(.72+.28*(1-dep)),
+            k=Math.min(1,.35+(a0+a1+a2)/3+.5*sunI),
+            wf=waterFlow(x,z,t),wv=wf.wave,shallow=1-dep,
+            // Οι φωτεινές κορυφές των κυμάτων σπάνε την ομοιόμορφη επιφάνεια.
+            crest=wf.crest*(.35+.65*sunI),
+            bt=clamp(.30+wv*.17+crest*.24,0,.72)*(1-dep*.72);
+          const deep=[24,72,112],shall=[92,157,151],foam=[190,211,190];
+          R=(deep[0]+(shall[0]-deep[0])*shallow)*(1-bt)+foam[0]*bt;
+          G=(deep[1]+(shall[1]-deep[1])*shallow)*(1-bt)+foam[1]*bt;
+          B=(deep[2]+(shall[2]-deep[2])*shallow)*(1-bt)+foam[2]*bt;
+          // Αντανάκλαση ουρανού, εντονότερη στα μακρινά και βαθύτερα νερά.
+          R=R*k*(1-refl)+f0*refl;G=G*k*(1-refl)+f1*refl;B=B*k*(1-refl)+f2*refl;
+          // Μικρές φωτεινές γραμμές στην κατεύθυνση της ροής.
+          const streak=clamp((wf.fine-.72)*3.2,0,1)*(.12+.38*sunI)*(1-dep*.65);
+          R+=(105-R)*streak;G+=(190-G)*streak;B+=(190-B)*streak;
+          gset=G_WATER;v=(.34+.48*k*(1-refl))*(1-f*.8)+.10*wv+.08*wf.fine;
+          // Ακανόνιστος αφρός στα ρηχά: διακεκομμένος, όχι συνεχής λευκή γραμμή.
+          const edge=clamp((.105-dep)*15,0,1),
+            foamBreak=wf.fine*.55+wf.crest*.45;
+          if(edge>0&&foamBreak>.42){const q=edge*clamp((foamBreak-.42)*2.4,0,1);
+            R+=(218-R)*q;G+=(226-G)*q;B+=(210-B)*q;v=Math.min(1,v+.22*q)}
+          // Ηλιακές ανταύγειες σε επιλεγμένες κορυφές, με χρονική και χωρική μεταβολή.
+          else if(sunUp&&crest>.38&&wf.fine>.48&&hash((x*5)|0,((z*5)|0)+((t*3)|0)*977)>.52)gint=true
+        }else{
+          let sh=Math.max(Sh[b0],TS[b0])/255;if(cs0)sh=Math.min(1,sh+cloudS(x,z,t)*.45);
+          const dif=Math.max(0,Nx[b0]*S0+Ny[b0]*S1+Nz[b0]*S2)*sunI*(1-sh*.85),ao=Am[b0]/100;let gk=Km[b0],cR=Cm[b0*3],cG=Cm[b0*3+1],cB=Cm[b0*3+2];
+          if(gk===0){cR*=gt[0];cG*=gt[1];cB*=gt[2]}
+          const sn=sn0*clamp((Ny[b0]-.62)*3,0,1);if(sn>0){cR+=(232-cR)*sn;cG+=(236-cG)*sn;cB+=(242-cB)*sn;if(sn>.5)gk=G_SNOW}
+          R=cR*(a0*ao+u0*dif);G=cG*(a1*ao+u1*dif);B=cB*(a2*ao+u2*dif);gset=gk;
+          // Πέτρες διαφορετικού μεγέθους στις όχθες, με ακανόνιστη κατανομή.
+          const bankDist=Math.abs(x-mer(z)),shore=clamp(1-Math.abs(bankDist-4.1)/3.5,0,1),
+            stone=hash(Math.floor(x*2.1),Math.floor(z*2.1));
+          if(shore>.12&&stone>.79&&h<WL+3.8){
+            const q=shore*clamp((stone-.79)*4.8,0,.78);
+            const rockTone=.72+.24*hash(Math.floor(x*4.7)+19,Math.floor(z*4.7)-7);
+            R=R*(1-q)+112*rockTone*q;G=G*(1-q)+108*rockTone*q;B=B*(1-q)+101*rockTone*q;gset=G_ROCK;
+          }
+          // Σπάνιες εκτεθειμένες ρίζες: λεπτές, καμπύλες γραμμές που ξεκινούν από την όχθη.
+          const rootLine=Math.abs(bankDist-(5.2+.65*Math.sin(z*.43+Math.sin(x*.17)*1.8))),
+            rootGate=hash(Math.floor(x*.42)+71,Math.floor(z*.42)+13);
+          if(bankDist>2.8&&bankDist<8.5&&rootLine<.16&&rootGate>.67&&h>WL+.15){
+            R=R*.58+TRK[0][0]*.42;G=G*.58+TRK[0][1]*.42;B=B*.58+TRK[0][2]*.42;gset=G_WOOD;
+          }
+          // Μικρές εποχικές ανθοφορίες, όχι ομοιόμορφο χαλί λουλουδιών.
+          const flower=hash(Math.floor(x*1.7)+301,Math.floor(z*1.7)-91);
+          if(SP.blo>.12&&h>WL+1&&h<WL+5&&flower>.996){
+            const q=SP.blo*clamp((flower-.996)*230,0,1);
+            R=R*(1-q)+240*q;G=G*(1-q)+184*q;B=B*(1-q)+210*q;gset=G_LEAF;
+          }
+          v=Math.max(R,G,B)/255*1.15*(1-f*.8);R+=(f0-R)*f;G+=(f1-G)*f;B+=(f2-B)*f}
+        // Λεπτή ομίχλη χαμηλά στην κοιλάδα, κυρίως κοντά στο ποτάμι και στο βάθος.
+        const riverMist=Math.exp(-Math.pow((x-mer(z))/17,2))*(.035+.045*(.5+.5*Math.sin(t*.22+z*.035)))*sm(18,105,zc);
+        const haze=clamp(f+riverMist*(1-f),0,.88);
+        R+=(f0-R)*riverMist;G+=(f1-G)*riverMist;B+=(f2-B)*riverMist;
+        const cs=CC[gset],r0=rt<0?0:rt,vf=.34*(1-haze);
+        for(let r=r0;r<top;r++){const i=r*COLS+c,nz=NOI[(r*131+c*17)&1023],m=1+(nz-.5)*vf;
+          if(gint&&nz>.55){code[i]=42;cr[i]=u0*255;cg[i]=u1*255;cb[i]=u2*255}
+          else{code[i]=cs[clamp(v*15+(nz-.5)*2.4,0,15)|0];cr[i]=R*m;cg[i]=G*m;cb[i]=B*m}
+          zb[i]=zc}
+        top=rt}
+      zc+=.1+zc*.013}}}
+
+// ═══ δέντρα, θάμνοι, καλάμια: προβολή + z-test (με «μπαλάκια» κελιών κοντά στην κάμερα), μετά σκίαση νικητών ═══
+function trees(cx,cz,cy,E,t){
+  const fx=FX,fz=FZ,rx=RX,rz=RZ,lim=W/2/F*1.25+.15,leaf=SP.leaf;visTrees=0;win.fill(-1);
+  for(let i=0;i<NT;i++){
+    const v=tv[i];let ddx=tx[i]-cx,ddz=tz[i]-cz;ddz-=Math.round(ddz/P)*P;
+    const z0=ddx*fx+ddz*fz;if(z0<(v<6?7:2.5)||z0>(v<6?MAXZ-8:PLOD[v-6]))continue;
+    const lat=ddx*rx+ddz*rz;if(Math.abs(lat)>z0*lim+8)continue;
+    if(v<6)visTrees++;const s=ts[i],y0=ty[i]-cy,w=tw[i]*s;
+    if(v<6&&z0>=55){   // μακρινό δέντρο: τρίγωνο (κωνοφόρο) ή έλλειψη (φυλλοβόλο), με κορμό όπου φαίνεται
+      const [hw,top,bot]=IMP[v],con=v<3,c0=(W/2+F*lat/z0)/CW,hw0=hw*w*F/z0/CW,sx=(c0*CW-W/2)*TANR,
+        rt=Math.floor((Hz+sx-F*(y0+top*s)/z0)/CH),rb=Math.floor((Hz+sx-F*(y0+bot*s)/z0)/CH);
+      if(rb<0||rt>=ROWS||c0+hw0<0||c0-hw0>=COLS)continue;
+      for(let r=Math.max(rt,0),re=Math.min(rb,ROWS-1);r<=re;r++){const yf=(r-rt)/Math.max(1,rb-rt),h=(con?yf:Math.sqrt(Math.max(0,1-(2*yf-1)*(2*yf-1))))*hw0*(.8+.4*NOI[(r*37+i)&1023]);
+        for(let c=Math.max(0,Math.round(c0-h)),ce=Math.min(COLS-1,Math.round(c0+h));c<=ce;c++){if(!con&&NOI[(r*29+c*11+i)&1023]>leaf+.2)continue;
+          const cell=r*COLS+c;if(z0<zb[cell]){zb[cell]=z0;win[cell]=i*1024+1023;aux[cell]=yf*255}}}
+      if(bot>1){const rg=Math.floor((Hz+sx-F*y0/z0)/CH),cc=Math.round(c0);
+        if(cc>=0&&cc<COLS)for(let r=Math.max(rb,0);r<=Math.min(rg,ROWS-1);r++){const cell=r*COLS+cc;if(z0<zb[cell]){zb[cell]=z0;win[cell]=i*1024+1022}}}
+      continue}
+    const d=TPL[v].d,n=d.length/ST,st=v<6?(z0<12?1:z0<60?2:4):(z0<10?1:z0<25?2:4),ca=tca[i],sa=tsa[i],
+      wind=Math.sin(t*.82+tx[i]*.31+tz[i]*.19)+.35*Math.sin(t*1.31+tz[i]*.47),
+      sw=(v===7?.052:v===6?.025:v<6?.018:0)*wind,rw=v<3?.17:v===6?.23:.2;
+    for(let k=0;k<n;k+=st){const o=k*ST,kind=d[o+6],ly=d[o+1]*s,lx=d[o]*w,lz=d[o+2]*w,px=ddx+lx*ca-lz*sa+ly*ly*sw,py=y0+ly,pz=ddz+lx*sa+lz*ca,zc=px*fx+pz*fz;if(zc<1)continue;
+      const fol=kind===0||(kind>=2&&kind<=4);
+      if(fol&&v>=3&&v<7&&leaf<1&&NOI[(k*7+i*3)&1023]>leaf+(v===6?.3:0))continue;                                      // χωρίς φύλλα το χειμώνα
+      if(fol&&(d[o+3]*ca-d[o+5]*sa)*px+d[o+4]*py+(d[o+3]*sa+d[o+5]*ca)*pz>.25*zc)continue;                              // πίσω πλευρά: κρύβεται
+      for(let rep=0,nr=z0<20&&fol&&v<6?2:1;rep<nr;rep++){
+        let qx=px,qy=py,qz=pz;if(rep){qx+=(NOI[(k*13+i)&1023]-.5)*.5*s;qy+=(NOI[(k*17+i*3)&1023]-.5)*.4*s;qz+=(NOI[(k*19+i*5)&1023]-.5)*.5*s}
+        const zq=qx*fx+qz*fz;if(zq<1)continue;const sxp=F*(qx*rx+qz*rz)/zq,
+          col=Math.floor((W/2+sxp)/CW),row=Math.floor((Hz+sxp*TANR-F*qy/zq)/CH),q=F*(kind===1?.05:kind===6?.035:rw*(nr>1?.62:1))*s*(st>1?1.35:1)/zq;
+        let a=q/CW<.8?0:Math.min(6,Math.round(q/CW)),b=q/CH<.8?0:Math.min(4,Math.round(q/CH));
+        if(kind===6||kind===1){a=0;b=Math.min(4,Math.max(0,Math.round(q*(kind===6?2.6:1.8)/CH)))}                                                 // καλάμι: λεπτή κατακόρυφη γραμμή
+        if(col<-a||col>=COLS+a||row<-b||row>=ROWS+b)continue;
+        const ia=a||1,ib=b||1;
+        for(let dr=-b;dr<=b;dr++){const r=row+dr;if(r<0||r>=ROWS)continue;
+          for(let dc=-a;dc<=a;dc++){const c=col+dc;if(c<0||c>=COLS)continue;if(dr*dr/(ib*ib)+dc*dc/(ia*ia)>1.15)continue;
+            const cell=r*COLS+c;if(zq<zb[cell]){zb[cell]=zq;win[cell]=i*1024+k}}}}}}
+  const [S0,S1,S2]=E.S,sunI=E.sunI,[a0,a1,a2]=E.amb,[u0,u1,u2]=E.sunC,[f0,f1,f2]=E.hor,snowT=SP.snow,blo=SP.blo;
+  for(let cell=0;cell<NC;cell++){const w=win[cell];if(w<0)continue;
+    const i=w>>10,kk=w&1023,v=tv[i],f=FOGT[(zb[cell]*2)|0],nz=NOI[(cell*7)&1023];let R,G,B,vv;
+    if(kk===1022){const c=TRK[v],dif=sunI*.5;R=c[0]*(a0+u0*dif);G=c[1]*(a1+u1*dif);B=c[2]*(a2+u2*dif);R+=(f0-R)*f;G+=(f1-G)*f;B+=(f2-B)*f;code[cell]=124;cr[cell]=R;cg[cell]=G;cb[cell]=B;continue}
+    if(kk===1023){const yf=aux[cell]/255,con=v<3,c=con?FOLCS[v]:FOLS[tc[i]],rr=(cell/COLS)|0,cc=cell-rr*COLS,dif=sunI*(.5+.3*(1-yf)),
+        bl=con?.78+.4*Math.max(0,Math.sin(yf*TAU*TIERS[v]+i)):.7+.55*BN[((((rr*.6)|0)+i*5)&63)*64+((((cc*.4)|0)+i*3)&63)],sh=bl*(.7+.5*(1-yf))*(.85+.3*nz);
+      R=c[0]*sh*(a0+u0*dif);G=c[1]*sh*(a1+u1*dif);B=c[2]*sh*(a2+u2*dif);
+      if(snowT>0&&con){const q=snowT*(.35+.3*(1-yf));R+=(235-R)*q;G+=(238-G)*q;B+=(245-B)*q}
+      vv=Math.max(R,G,B)/255*1.25*(1-f*.8);R+=(f0-R)*f;G+=(f1-G)*f;B+=(f2-B)*f;
+      code[cell]=CC[G_LEAF][clamp(vv*15+(nz-.5)*2,0,15)|0];cr[cell]=R;cg[cell]=G;cb[cell]=B;continue}
+    const d=TPL[v].d,o=kk*ST,kind=d[o+6],ca=tca[i],sa=tsa[i],fol=kind===0||(kind>=2&&kind<=4),ao=d[o+7],
+      nd=(d[o+3]*ca-d[o+5]*sa)*S0+d[o+4]*S1+(d[o+3]*sa+d[o+5]*ca)*S2;let c=fol?(v<3?FOLCS[v]:FOLS[tc[i]]):kind===6?KCOL[6]:v<6?TRK[v]:KCOL[1];
+    if(fol&&v>=3&&v<6&&blo>0&&tb[i]<blo)c=BLO[(tb[i]*997|0)&1];
+    const tn=TONE[kind]||TONE[0],dif=sunI*(Math.max(0,nd)+(fol?.28*Math.max(0,-nd):0)),sh=(.55+.55*ao)*(fol?.85+.25*d[o+1]*ts[i]/6:1)*(.8+.4*nz);
+    R=c[0]*tn[0]*sh*(a0*ao+u0*dif);G=c[1]*tn[1]*sh*(a1*ao+u1*dif);B=c[2]*tn[2]*sh*(a2*ao+u2*dif);
+    if(kind===1){R=Math.min(R,225);G=Math.min(G,225);B=Math.min(B,225)}
+    if(snowT>0&&(v<3||v===6)&&fol&&ao>.72){const q=snowT*.55;R+=(235-R)*q;G+=(238-G)*q;B+=(245-B)*q}
+    vv=Math.max(R,G,B)/255*1.25*(1-f*.8);R+=(f0-R)*f;G+=(f1-G)*f;B+=(f2-B)*f;
+    code[cell]=CC[fol?G_LEAF:G_WOOD][clamp(vv*15+(nz-.5)*2,0,15)|0];cr[cell]=R;cg[cell]=G;cb[cell]=B}}
+
+// ═══ ουρανός: σύννεφα, αστέρια πάνω στην ουράνια σφαίρα, ήλιος ═══
+function sky(yaw,E,t){
+  const cl=mix(E.top,[255,255,255],.35+.65*E.day),warm=E.warm*.55;
+  for(let c=0;c<COLS;c++){const dxp=(c+.5)*CW-W/2,lat=dxp/F,sh=dxp*TANR;
+    for(let r=0;r<ROWS;r++){const vert=(Hz+sh-(r+.5)*CH)/F;if(vert<-.05)break;const i=r*COLS+c;if(zb[i]<1e8)continue;const q=vert+.22;
+      const n=.48*vnoise(lat/q*1.05+yaw*3+t*.018,1.1/q+t*.009,1<<20)
+        +.34*vnoise(lat/q*2.35+7+yaw*3,2.6/q+t*.014,1<<20)
+        +.18*vnoise(lat/q*4.8-13+yaw*2,5.1/q,1<<20);
+      // Απαλές ηλιακές λωρίδες μέσα στην ατμόσφαιρα, όχι έντονες ακτίνες τύπου προβολέα.
+      const beamAxis=(E.S[0]*FZ-E.S[2]*FX)/Math.max(.08,E.S[0]*FX+E.S[2]*FZ),
+        beam=Math.exp(-Math.pow((lat-beamAxis*.16)/(.12+vert*.22),2))*.045*E.sunI*clamp(vert*2,0,1);
+      if(n>.585&&vert>-.02){const d=clamp((n-.585)/.25,0,1),k=(.42+.58*d)*(.55+.45*E.day);
+        code[i]=CC[G_CLOUD][clamp(d*10+2,0,15)|0];cr[i]=(cl[0]+(255-cl[0])*warm)*k;cg[i]=(cl[1]+(150-cl[1])*warm)*k;cb[i]=(cl[2]+(110-cl[2])*warm)*k}
+      else if(beam>.004){cr[i]=cl[0]*beam;cg[i]=cl[1]*beam;cb[i]=cl[2]*beam}}}
+}
+function birds(t){
+  // Μακρινά πουλιά σε μικρά, ασύγχρονα σμήνη. Η κίνηση είναι ήπια και διακριτική.
+  if(SP.snow>.96)return;
+  for(let flock=0;flock<3;flock++){
+    const count=3+(flock%2),base=((t*(2.2+flock*.55)+flock*W*.39)%(W+90))-45,
+      y=Hz*(.42+flock*.16)+Math.sin(t*.42+flock*2.1)*7;
+    for(let b=0;b<count;b++){
+      const x=base+b*9+Math.sin(t*.7+b+flock)*2.5,yy=y+Math.sin(t*1.15+b*1.7+flock)*3.2,
+        col=Math.floor(x/CW),row=Math.floor(yy/CH);
+      if(col<1||col>=COLS-1||row<1||row>=ROWS)continue;
+      const i=row*COLS+col;if(zb[i]<1e8)continue;
+      code[i]=b%2?118:94;cr[i]=34;cg[i]=43;cb[i]=48;
+      if(col+1<COLS&&zb[i+1]>=1e8){code[i+1]=b%2?118:94;cr[i+1]=34;cg[i+1]=43;cb[i+1]=48}
+    }
+  }
+}
+function stars(yaw,E,t){   // κάθε αστέρι έχει σταθερή θέση στον ουρανό: κινείται στην οθόνη όταν στρίβουμε και γυρίζει αργά με τη νύχτα
+  if(E.night<.2)return;const fx=FX,fz=FZ,rot=t*.006;
+  for(let s=0;s<NSTAR;s++){const az=STAR_AZ[s]+rot,ce=Math.cos(STAR_EL[s]),y=Math.sin(STAR_EL[s]),dx=ce*Math.sin(az),dz=ce*Math.cos(az),zc=dx*fx+dz*fz;
+    if(zc<.08)continue;const sx=F*(dx*RX+dz*RZ)/zc,col=Math.floor((W/2+sx)/CW),row=Math.floor((Hz+sx*TANR-F*y/zc)/CH);
+    if(col<0||col>=COLS||row<0||row>=ROWS)continue;const i=row*COLS+col;if(zb[i]<1e8||code[i])continue;
+    const b=STAR_B[s],v=(110+140*b)*(.65+.35*Math.sin(t*3+s))*E.night;code[i]=b>.9?42:46;cr[i]=cg[i]=v;cb[i]=v+10}}
+function sun(E){
+  const zc=E.S[0]*FX+E.S[2]*FZ;if(zc<.05||E.sy<-.08)return;
+  const px=W/2+F*(E.S[0]*FZ-E.S[2]*FX)/zc,py=Hz+(px-W/2)*TANR-F*E.S[1]/zc,R=16,G=70,c0=Math.floor(px/CW),r0=Math.floor(py/CH),rc=Math.ceil(G/CW),rr=Math.ceil(G/CH);
+  for(let r=r0-rr;r<=r0+rr;r++)for(let c=c0-rc;c<=c0+rc;c++){if(r<0||r>=ROWS||c<0||c>=COLS)continue;const i=r*COLS+c;if(zb[i]<1e8)continue;
+    const d=Math.hypot((c+.5)*CW-px,(r+.5)*CH-py);
+    if(d<R){code[i]=d<R*.6?64:79;cr[i]=255;cg[i]=E.sunC[1]*255;cb[i]=E.sunC[2]*255}
+    else if(d<G&&!code[i]){const g=Math.pow(1-(d-R)/(G-R),2)*(.4+.6*E.sunI);code[i]=g>.35?58:46;cr[i]=E.sunC[0]*255*g;cg[i]=E.sunC[1]*255*g;cb[i]=E.sunC[2]*255*g}}}
+
+// ═══ ένα καρέ: σταθερή πτήση κατά μήκος του ποταμού, σε μέσο ύψος ═══
+function frame(t){
+  const E=env(t),cz=flightZ,cx=mer(cz),yaw=Math.atan2(mer(cz+15)-cx,15)*.9,cy=hAt(cx,cz)+CRUISE;
+  const rate=(yaw-prevYaw)/Math.max(DT,1e-3);prevYaw=yaw;rollS+=(clamp(-rate*3.5,-.12,.12)-rollS)*(1-Math.exp(-DT*3));TANR=Math.tan(rollS);   // κλίση στις στροφές
+  FX=Math.sin(yaw);FZ=Math.cos(yaw);RX=FZ;RZ=-FX;Hz=H*.4;
+  for(let i=0;i<256;i++){const tt=Math.pow(i/255,1.5);for(let q=0;q<3;q++)SKYT[i*3+q]=E.top[q]+(E.hor[q]-E.top[q])*tt}
+  code.fill(0);zb.fill(1e9);
+  shadowStep(E);terrain(cx,cz,cy,E,t);trees(cx,cz,cy,E,t);sky(yaw,E,t);birds(t);stars(yaw,E,t);sun(E);
+  return E}
+
+// ═══ οθόνη ═══
+function pack(){
+  for(let r=0,i=0,o=0;r<ROWS;r++){const py=(r+.5)*CH;
+    for(let c=0;c<COLS;c++,i++,o+=4){A[o]=cr[i];A[o+1]=cg[i];A[o+2]=cb[i];A[o+3]=code[i]||32;
+      if(zb[i]<1e8){B[o]=cr[i]*.55;B[o+1]=cg[i]*.55;B[o+2]=cb[i]*.55}
+      else{const ix=(clamp((py-((c+.5)*CW-W/2)*TANR)/Hz,0,1)*255|0)*3;B[o]=SKYT[ix];B[o+1]=SKYT[ix+1];B[o+2]=SKYT[ix+2]}B[o+3]=255}}
+  gl.activeTexture(gl.TEXTURE0);gl.bindTexture(gl.TEXTURE_2D,tA);gl.texSubImage2D(gl.TEXTURE_2D,0,0,0,COLS,ROWS,gl.RGBA,gl.UNSIGNED_BYTE,A);
+  gl.activeTexture(gl.TEXTURE1);gl.bindTexture(gl.TEXTURE_2D,tB);gl.texSubImage2D(gl.TEXTURE_2D,0,0,0,COLS,ROWS,gl.RGBA,gl.UNSIGNED_BYTE,B);
+  gl.drawArrays(gl.TRIANGLES,0,3)}
+function hudDraw(E,t){
+  const dpr=window.devicePixelRatio||1,w=innerWidth,h=innerHeight;hx.setTransform(dpr,0,0,dpr,0,0);hx.clearRect(0,0,w,h);hx.font="13px "+MONO;hx.textBaseline="top";hx.textAlign="left";
+  const hh=Math.floor(E.hour),mm=Math.floor((E.hour-hh)*60),s=((ctl.ss%4)+4)%4,L=[[SIGNATURE,"rgb(190,184,210)"],
+    ["time "+String(hh).padStart(2,"0")+":"+String(mm).padStart(2,"0")+"   "+SEASN[Math.round(s)%4],"rgb(190,198,215)"],
+    ["speed "+Math.round(SPEED*3.6)+" m/s   trees "+visTrees,"rgb(190,198,215)"]];
+  hx.shadowColor="rgba(0,0,0,.7)";hx.shadowBlur=4;L.forEach(([s,c],i)=>{hx.fillStyle=c;hx.fillText(s,16,h-22*L.length-14+22*i)});
+  hx.textAlign="right";hx.fillStyle="rgb(255,196,90)";hx.fillText(paused?"paused":"t "+t.toFixed(1)+"s",w-16,14);
+  hx.fillStyle="rgba(220,226,240,.6)";hx.fillText("Space pause · T ώρα · E εποχή · S screenshot",w-16,h-26)}
+
+addEventListener("resize",layout);layout();
+let t=0,paused=false,last=performance.now(),acc=0,ema=20,n=0;
+function loop(now){
+  requestAnimationFrame(loop);acc+=now-last;last=now;if(acc<1000/FPS-3)return;
+  const dt=Math.min(acc,100)/1000;acc=0;DT=dt;
+  if(!paused){t+=dt;flightZ+=dt*SPEED}
+  const t0=performance.now();updateState(t,dt);const E=frame(t);pack();hudDraw(E,t);ema=ema*.9+(performance.now()-t0)*.1;
+  if(!FIXED&&++n%45===0){   // αυτόματη προσαρμογή: ευκρίνεια όσο αντέχει το μηχάνημα
+    if(ema>30&&CWC<10){CWC=Math.min(10,CWC*1.15);layout();ema=20}
+    else if(ema<13&&CWC>2.01){CWC=Math.max(2,CWC/1.1);layout();ema=20}}
+}
+addEventListener("keydown",e=>{
+  if(e.code==="Space"){paused=!paused;e.preventDefault()}
+  else if(e.key==="r"||e.key==="R"){t=0;flightZ=0}
+  else if(e.key==="t"||e.key==="T")t+=DAY/8;
+  else if(e.key==="e"||e.key==="E")ctl.ssT=Math.round(ctl.ssT)+1;
+  else if(e.key==="s"||e.key==="S")glc.toBlob(b=>{const a=document.createElement("a");a.href=URL.createObjectURL(b);a.download="ascii_valley.png";a.click()})});
+requestAnimationFrame(loop);
+</script></body></html>
